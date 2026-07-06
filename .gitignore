@@ -1,0 +1,11 @@
+# Personal financial data — never commit this
+finances.db
+finances.db.bak*
+*.db
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
