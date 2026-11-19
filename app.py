@@ -97,6 +97,7 @@ INCOME_AMOUNT = "#3ddc84"
 EXPENSE_AMOUNT = "#e06c75"
 MIXED_AMOUNT = "#7090e0"
 UNPAID_STYLE = "#8a8a9a"        # muted but readable (stays legible on the selection highlight)
+ROW_STYLE = "#c8c8d4"           # normal (paid) row text — set explicitly so the row cursor highlight never recolors it
 OVERSPEND_STYLE = "#ff6b6b"
 AVAILABLE_STYLE = "#3ddc84"
 DIM_WHITE = "#a0a0a0"           # muted white for dashboard headings/labels (calmer than the accent colors)
@@ -118,20 +119,21 @@ def group_style(item_types) -> str:
         return EXPENSE_STYLE
     return MIXED_STYLE
 
-def compute_bcc_bar_segments(cc_unpaid: float, tcn: float, tci: float, arriendo: float, current_bcc: float):
-    """Percentage widths for the dashboard's CURRENT BCC bar: the box represents 100% =
-    CURRENT BCC, and cc_unpaid/tcn/tci/arriendo are drawn as proportional segments inside
-    it — a direct visualization of the REAL EXPECTED formula. Under capacity, the unused
-    space is the 'leftover' (= REAL EXPECTED) segment. Over capacity (commitments exceed
-    CURRENT BCC), segments are rescaled to fill exactly 100% — same never-overflow rule
-    used elsewhere in this app — and there's no leftover segment; the caller shows the
-    shortfall as text instead. Returns (pcts: list[float] len 4, leftover_pct, overspent)."""
-    amounts = [max(0.0, cc_unpaid), max(0.0, tcn), max(0.0, tci), max(0.0, arriendo)]
+def compute_bcc_bar_segments(cc_unpaid: float, tcn: float, tci: float, funds: float):
+    """Percentage widths for the dashboard's balance bar: the box represents 100% = funds
+    (CURRENT BCC + still-unpaid CC income, i.e. everything REAL EXPECTED starts from), and
+    cc_unpaid/tcn/tci are drawn as proportional segments inside it — a direct visualization
+    of the REAL EXPECTED formula. Under capacity, the unused space is the 'leftover'
+    (= REAL EXPECTED) segment. Over capacity (commitments exceed funds), segments are
+    rescaled to fill exactly 100% — same never-overflow rule used elsewhere in this app —
+    and there's no leftover segment; the caller shows the shortfall as text instead.
+    Returns (pcts: list[float] len 3, leftover_pct, overspent)."""
+    amounts = [max(0.0, cc_unpaid), max(0.0, tcn), max(0.0, tci)]
     total = sum(amounts)
-    overspent = current_bcc <= 0 or total > current_bcc
-    baseline = total if overspent else current_bcc
+    overspent = funds <= 0 or total > funds
+    baseline = total if overspent else funds
     if baseline <= 0:
-        return [0.0, 0.0, 0.0, 0.0], 0.0, overspent
+        return [0.0, 0.0, 0.0], 0.0, overspent
     pcts = [amt / baseline * 100 for amt in amounts]
     leftover_pct = 0.0 if overspent else max(0.0, 100 - sum(pcts))
     return pcts, leftover_pct, overspent
@@ -249,6 +251,10 @@ def delete_transaction(tx_id):
     with sqlite3.connect(DB_NAME) as conn:
         conn.execute("DELETE FROM transactions WHERE id = ?", (tx_id,))
 
+def delete_transactions(tx_ids):
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.executemany("DELETE FROM transactions WHERE id = ?", [(tx_id,) for tx_id in tx_ids])
+
 def toggle_transaction_status(tx_id):
     with sqlite3.connect(DB_NAME) as conn:
         conn.execute("UPDATE transactions SET status = CASE WHEN status='Paid' THEN 'Unpaid' ELSE 'Paid' END WHERE id=?", (tx_id,))
@@ -267,19 +273,18 @@ def get_line_item_amount(period, account, description):
         return row[0] if row and row[0] is not None else None
 
 def compute_balance_components(period, txs):
-    """Shared balance math for a period: (tcn, tci, cc_egresos_unpaid, deduction, deduction_is_auto).
+    """Shared balance math for a period: (tcn, tci, cc_egresos_unpaid, cc_income_unpaid).
     Used by both the main UI (calculate_balances) and the DashboardScreen, so the two never
     drift apart. tcn/tci are the FULL statement total (paid + unpaid) — REAL EXPECTED treats
-    the whole card balance as a draw against current funds, not just what's still unpaid."""
+    the whole card balance as a draw against current funds, not just what's still unpaid.
+    cc_income_unpaid is income still marked Unpaid (e.g. a paycheck not yet received): REAL
+    EXPECTED is the projected end-of-period scenario, so pending income counts, same as
+    pending expenses do."""
     tcn = sum(tx[6] for tx in txs if tx[2] == 'TCN' and tx[3] == 'Expense')
     tci = sum(tx[6] for tx in txs if tx[2] == 'TCI' and tx[3] == 'Expense')
     cc_egresos_unpaid = sum(tx[6] for tx in txs if tx[2] == 'CC' and tx[3] == 'Expense' and tx[4] == 'Egresos' and tx[7] != 'Paid')
-    auto_deduction = get_line_item_amount(next_period(period), 'CC', 'Arriendo')
-    if auto_deduction is None:
-        auto_deduction = get_line_item_amount(period, 'CC', 'Arriendo')
-    deduction_is_auto = auto_deduction is not None
-    deduction = auto_deduction if deduction_is_auto else get_setting("arriendo_proximo_mes", 0)
-    return tcn, tci, cc_egresos_unpaid, deduction, deduction_is_auto
+    cc_income_unpaid = sum(tx[6] for tx in txs if tx[2] == 'CC' and tx[3] == 'Income' and tx[7] != 'Paid')
+    return tcn, tci, cc_egresos_unpaid, cc_income_unpaid
 
 def compute_current_bcc(txs):
     """Actual settled checking balance: only PAID CC transactions count. Unlike REAL
@@ -585,7 +590,6 @@ class DashboardScreen(Screen):
                 yield Static("", id="seg-cc-unpaid", classes="bcc-segment")
                 yield Static("", id="seg-tcn", classes="bcc-segment")
                 yield Static("", id="seg-tci", classes="bcc-segment")
-                yield Static("", id="seg-arriendo", classes="bcc-segment")
                 yield Static("", id="seg-leftover", classes="bcc-segment")
             with Horizontal(id="dash-legend-row"):
                 pass
@@ -604,15 +608,15 @@ class DashboardScreen(Screen):
         period = self.period
         txs = get_transactions(period)
         current_bcc = compute_current_bcc(txs)
-        tcn, tci, cc_unpaid, deduction, _ = compute_balance_components(period, txs)
-        real_expected = current_bcc - tcn - tci - cc_unpaid - deduction
+        tcn, tci, cc_unpaid, income_unpaid = compute_balance_components(period, txs)
+        funds = current_bcc + income_unpaid
+        real_expected = funds - tcn - tci - cc_unpaid
 
-        pcts, leftover_pct, overspent = compute_bcc_bar_segments(cc_unpaid, tcn, tci, deduction, current_bcc)
+        pcts, leftover_pct, overspent = compute_bcc_bar_segments(cc_unpaid, tcn, tci, funds)
         seg_specs = [
             ("#seg-cc-unpaid", cc_unpaid, CC_UNPAID_COLOR, "Unpaid Cta. Corriente"),
             ("#seg-tcn", tcn, TCN_COLOR, "TCN"),
             ("#seg-tci", tci, TCI_COLOR, "TCI"),
-            ("#seg-arriendo", deduction, ARRIENDO_COLOR, "Próximo Arriendo"),
         ]
         legend_items = []
         for (selector, amount, color, label), pct in zip(seg_specs, pcts):
@@ -620,7 +624,7 @@ class DashboardScreen(Screen):
             seg.styles.width = f"{pct}%"
             seg.styles.background = color
             # Two lines — name on top, amount below — so each legend stays narrow and the
-            # five sit in one row, same left-to-right order as the bar segments.
+            # four sit in one row, same left-to-right order as the bar segments.
             item = Text("● ", style=color)
             item.append(f"{label}\n", style="#9090a8")
             item.append(f"${amount:,.0f}", style="#c8c8d4")
@@ -677,6 +681,7 @@ class FinanceTrackerApp(App):
         ("a", "add_transaction", "Add Trans"),
         ("e", "edit_transaction", "Edit Trans"),
         ("d", "delete_transaction", "Delete Trans"),
+        ("ctrl+k", "delete_all_transactions", "Delete All"),
         ("space", "toggle_status", "Toggle Paid"),
         ("ctrl+t", "toggle_checked", "Tick"),
         ("n", "new_tree_item", "New Tree Item"),
@@ -705,7 +710,9 @@ class FinanceTrackerApp(App):
 
     DataTable { height: 1fr; background: #0d0d1a; }
     DataTable > .datatable--header { background: #141422; color: #4a6a9a; text-style: bold; }
-    DataTable > .datatable--cursor { background: #2c3a63; }
+    /* Selected row: only a slightly-lighter background — keep every cell's own text color/style.
+       (Textual's default cursor also sets color + bold via $block-cursor-*, so pin them back.) */
+    DataTable > .datatable--cursor { background: #1c1c2b; color: #c8c8d4; text-style: none; }
     DataTable > .datatable--hover { background: #14141e; }
 
     #top-bar { height: auto; padding-bottom: 0; border-bottom: solid #222235; margin-bottom: 1; }
@@ -740,11 +747,11 @@ class FinanceTrackerApp(App):
                 yield Tree("My Finances", id="finance_tree")
                 with Vertical(id="sidebar-balances"):
                     yield Label("CURRENT BCC: $0", id="lbl_current_bcc", classes="balance-label balance-current")
+                    yield Label("INGRESOS CC UNPAID: $0", id="lbl_income_unpaid", classes="balance-label balance-card")
                     yield Rule(classes="bal-rule")
                     yield Label("TCN: $0", id="lbl_tcn", classes="balance-label balance-card")
                     yield Label("TCI: $0", id="lbl_tci", classes="balance-label balance-card")
                     yield Label("EGRESOS CC UNPAID: $0", id="lbl_cc_unpaid", classes="balance-label balance-card")
-                    yield Label("ARRIENDO PRÓX.: $0", id="lbl_deduction", classes="balance-label balance-card clickable")
                     yield Label("", id="lbl_real_calc", classes="balance-calc")
                     yield Label("REAL EXPECTED: $0", id="lbl_real", classes="balance-label balance-real")
             
@@ -865,8 +872,13 @@ class FinanceTrackerApp(App):
 
         self.query_one("#lbl_period_range", Label).update(period_range_label(period))
         table = self.query_one(DataTable)
+        # Remember which row the cursor is on so a refresh (tick, toggle paid, edit…)
+        # doesn't snap it back to the first row.
+        prev_row_key = None
+        if table.row_count:
+            prev_row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
         table.clear()
-        
+
         txs = get_transactions(period)
         filtered_txs = txs
         
@@ -880,7 +892,7 @@ class FinanceTrackerApp(App):
                 
         for tx in filtered_txs:
             paid = tx[7] == 'Paid'
-            style = "" if paid else UNPAID_STYLE
+            style = ROW_STYLE if paid else UNPAID_STYLE
             status_icon = Text("[✓]", style="#3ddc84") if paid else Text("[ ]", style="#6a6a7a")
             tick = Text("✓", style="bold #3ddc84") if tx[9] else Text("")
             acc_style = ACCOUNT_STYLES.get(tx[2], "") if paid else style
@@ -906,6 +918,9 @@ class FinanceTrackerApp(App):
                 key=str(tx[0])
             )
             
+        if prev_row_key is not None and prev_row_key in {str(tx[0]) for tx in filtered_txs}:
+            table.move_cursor(row=table.get_row_index(prev_row_key))
+
         self.calculate_balances(txs)
         self.update_subtotal_label(filtered_txs)
 
@@ -931,17 +946,16 @@ class FinanceTrackerApp(App):
 
     def calculate_balances(self, txs) -> None:
         period = self.query_one("#input_period", Select).value
-        tcn, tci, cc_unpaid, deduction, deduction_is_auto = compute_balance_components(period, txs)
+        tcn, tci, cc_unpaid, income_unpaid = compute_balance_components(period, txs)
         current_bcc = compute_current_bcc(txs)
-        balance_real = current_bcc - tcn - tci - cc_unpaid - deduction
+        balance_real = current_bcc + income_unpaid - tcn - tci - cc_unpaid
 
         self.query_one("#lbl_current_bcc", Label).update(f"CURRENT BCC: ${current_bcc:,.0f}")
+        self.query_one("#lbl_income_unpaid", Label).update(f"INGRESOS CC UNPAID: ${income_unpaid:,.0f}")
         self.query_one("#lbl_tcn", Label).update(f"TCN: ${tcn:,.0f}")
         self.query_one("#lbl_tci", Label).update(f"TCI: ${tci:,.0f}")
         self.query_one("#lbl_cc_unpaid", Label).update(f"EGRESOS CC UNPAID: ${cc_unpaid:,.0f}")
-        source_tag = " (auto)" if deduction_is_auto else " (manual)"
-        self.query_one("#lbl_deduction", Label).update(f"ARRIENDO PRÓX.: ${deduction:,.0f}{source_tag}")
-        self.query_one("#lbl_real_calc", Label).update(f"{current_bcc:,.0f} - {tcn:,.0f} - {tci:,.0f} - {cc_unpaid:,.0f} - {deduction:,.0f}")
+        self.query_one("#lbl_real_calc", Label).update(f"{current_bcc:,.0f} + {income_unpaid:,.0f} - {tcn:,.0f} - {tci:,.0f} - {cc_unpaid:,.0f}")
         real_lbl = self.query_one("#lbl_real", Label)
         if balance_real < 0:
             # Current funds can't cover the statement — you'd have to dip into next month's pay.
@@ -960,24 +974,6 @@ class FinanceTrackerApp(App):
             carry_forward_period(event.value)
             self.build_tree_structure()
             self.refresh_table()
-
-    @on(Click, "#lbl_deduction")
-    def on_deduction_click(self, event: Click) -> None:
-        current_val = get_setting("arriendo_proximo_mes", 0)
-        self.push_screen(InputModal("Manual fallback for 'Arriendo Próximo Mes'", "Amount", str(int(current_val))), self.save_deduction)
-
-    def save_deduction(self, val: str) -> None:
-        if val is not None:
-            try:
-                set_setting("arriendo_proximo_mes", float(val))
-                self.refresh_table()
-                self.notify(
-                    "Guardado. Solo se usará si no hay una transacción 'Arriendo' registrada "
-                    "(este período o el próximo) — si existe, se prioriza su monto real.",
-                    severity="information"
-                )
-            except ValueError:
-                self.notify("Amount must be a valid number", severity="error")
 
     # --- Hotkey Actions ---
     def action_toggle_status(self) -> None:
@@ -1040,6 +1036,21 @@ class FinanceTrackerApp(App):
         if confirmed:
             delete_transaction(tx_id)
             self.notify("Transaction deleted.", severity="info")
+            self.refresh_table()
+
+    def action_delete_all_transactions(self) -> None:
+        table = self.query_one(DataTable)
+        if not table.row_count:
+            self.notify("No transactions to delete in this view.", severity="warning")
+            return
+        tx_ids = [int(row_key.value) for row_key in table.rows.keys()]
+        self.push_screen(ConfirmModal(f"Delete all {len(tx_ids)} transactions in this view?"), lambda confirmed: self._do_delete_all_transactions(tx_ids, confirmed))
+
+    def _do_delete_all_transactions(self, tx_ids: list, confirmed: bool) -> None:
+        if confirmed:
+            delete_transactions(tx_ids)
+            self.notify(f"{len(tx_ids)} transactions deleted.", severity="info")
+            self.build_tree_structure()
             self.refresh_table()
 
     def action_show_dashboard(self) -> None:
