@@ -4,7 +4,6 @@ from textual.app import App, ComposeResult
 from textual.screen import ModalScreen, Screen
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Header, Footer, DataTable, Input, Button, Select, Tree, Label, Rule, Static
-from textual.events import Click
 from textual.theme import Theme
 from textual import on
 from rich.text import Text
@@ -69,11 +68,6 @@ def period_range_label(period: str) -> str:
     start = date(py, pm, STATEMENT_CLOSE_DAY + 1)
     return f"{start.strftime('%d %b')} - {end.strftime('%d %b')}"
 
-def next_period(period: str) -> str:
-    y, m = map(int, period.split("-"))
-    y, m = (y + 1, 1) if m == 12 else (y, m + 1)
-    return f"{y}-{m:02d}"
-
 def node_base_text(prefix: str, name: str) -> str:
     return f"{prefix} {name}"
 
@@ -107,7 +101,6 @@ DIM_WHITE_LOW = "#787880"       # a touch dimmer, for secondary bits like the (a
 CC_UNPAID_COLOR = "#d4a843"   # gold, matches CC account color
 TCN_COLOR = "#a06cd5"         # matches ACCOUNT_STYLES TCN
 TCI_COLOR = "#4ec9b0"         # matches ACCOUNT_STYLES TCI
-ARRIENDO_COLOR = "#e06c75"
 GROUP_BAR_COLOR = "#56d8e6"   # cyan, matches the month selector — used for every group's fill bar
 
 def group_style(item_types) -> str:
@@ -222,16 +215,6 @@ def init_db():
         ''')
         conn.commit()
 
-# Settings DB Calls
-def get_setting(key, default="0"):
-    with sqlite3.connect(DB_NAME) as conn:
-        res = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
-        return float(res[0]) if res else float(default)
-
-def set_setting(key, value):
-    with sqlite3.connect(DB_NAME) as conn:
-        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
-
 # Transactions DB Calls
 def get_transactions(period):
     with sqlite3.connect(DB_NAME) as conn:
@@ -262,15 +245,6 @@ def toggle_transaction_status(tx_id):
 def toggle_transaction_checked(tx_id):
     with sqlite3.connect(DB_NAME) as conn:
         conn.execute("UPDATE transactions SET checked = CASE WHEN checked=1 THEN 0 ELSE 1 END WHERE id=?", (tx_id,))
-
-def get_line_item_amount(period, account, description):
-    """Sum of a specific line item's amount within a period, or None if it has no rows there."""
-    with sqlite3.connect(DB_NAME) as conn:
-        row = conn.execute(
-            "SELECT SUM(amount) FROM transactions WHERE period=? AND account=? AND description=?",
-            (period, account, description)
-        ).fetchone()
-        return row[0] if row and row[0] is not None else None
 
 def compute_balance_components(period, txs):
     """Shared balance math for a period: (tcn, tci, cc_egresos_unpaid, cc_income_unpaid).
